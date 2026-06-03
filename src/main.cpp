@@ -30,6 +30,7 @@ const float ENCODER_PULSES_PER_REV = 20.0f;
 const float ENCODER_COUNTS_PER_REV = ENCODER_PULSES_PER_REV * 4.0f;
 const int MIN_PWM_A = 35;
 const int MIN_PWM_B = 40;
+const int PID_DEADHAND = 5;
 
 float balanceTargetRPM = 0.0f;
 float balanceOutput = 0.0f;
@@ -326,7 +327,7 @@ void setup() {
 
     pidA.setpoint = 0;
     pidB.setpoint = 0;
-    pidBalance.setpoint = 92.0f;
+    pidBalance.setpoint = 90.0f;
     pidA.setIntegralLimits(-200, 200);
     pidB.setIntegralLimits(-200, 200);
     pidBalance.setIntegralLimits(-100, 100);
@@ -349,7 +350,6 @@ void setup() {
         packetSize = mpu.dmpGetFIFOPacketSize();
         dmpReady = true;
         imuCalibrated = true;
-        pidBalance.setpoint = 0.0f;
         Serial.println("MPU6050 DMP ready");
         printMenu();
     } else {
