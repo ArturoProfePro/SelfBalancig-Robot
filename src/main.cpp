@@ -1,259 +1,347 @@
-    #include "I2Cdev.h"
-    #include "MPU6050_6Axis_MotionApps20.h"
-    MPU6050 mpu;
+#include <Arduino.h>
+#include "I2Cdev.h"
+#include "MPU6050_6Axis_MotionApps20.h"
+#include "Wire.h"
+#include <SoftwareSerial.h>
+SoftwareSerial BTSerial(6, 11); // RX, TX
 
+MPU6050 mpu;
 
-    #define ENC1A 2
-    #define ENC1B 5
-    #define ENC2A 3
-    #define ENC2B 6
+#define ENC1A 2
+#define ENC1B 4
+#define ENC2A 3
+#define ENC2B 5
 
+volatile long enc1 = 0;
+volatile long enc2 = 0;
 
-    volatile long enc1 = 0;
-    volatile long enc2 = 0;
+#define motorA1 12
+#define motorA2 13
+#define motorB1 7
+#define motorB2 8
+#define motorAPWM 10
+#define motorBPWM 9
 
-    #define motorA1 13 
-    #define motorA2 12 
-    #define motorB1 8
-    #define motorB2 7
-    #define motorAPWM 11
-    #define motorBPWM  10
+unsigned long lastLoopCheck = 0;
+const unsigned long loopInterval = 10;
+const unsigned long loopIntervalForControl = 100; // 100 Гц
 
-    #define MinPWM 35
+static long prevEnc1 = 0;
+static long prevEnc2 = 0;
 
-    // Характеристики вашего энкодера (укажите сколько тиков на 1 оборот)
-    const float pulsesPerRevolution = 540.0; 
+#define MinPWM 35
 
-    // Переменные для расчета скорости
-    unsigned long lastSpeedCheck = 0;
-    const unsigned long speedCheckInterval = 50; // Расчет скорости каждые 50 мс
+// --- Переменные для адаптивного сетпоинта ---
+const float initialSetPoint = 6.9f; // ПРОВЕРЬ ЭТОТ УГОЛ РУКАМИ!
 
-    long prevEnc1 = 0;
-    long prevEnc2 = 0;
+float smoothedPWM = 0.0f;
 
-    float speedRPM1 = 0.0;
-    float speedRPM2 = 0.0;
+const int targetEnc = 0;
 
+const float K_pos = 0.002f;  // Насколько сильно робот хочет вернуться в начальную точку
+const float K_speed = 0.05f; // Насколько сильно робот гасит свою скорость (аналог Kd для колес)
 
-    struct PID {
-        float kp;
-        float ki;
-        float kd;
-        float setpoint;
-        float integral;
-        float integralMin;
-        float integralMax;
-        float lastError;
-        float outMin;
-        float outMax;
-        float pTerm;
-        float iTerm;
-        float dTerm;
-        unsigned long lastTime;
+unsigned long controlTimer = 500;       // Таймер для сброса
+const unsigned long controlDelay = 500; // Промежуток времени (0.5 сек)
+bool isControlActive = false;           // Флаг, что управление сейчас активно
 
-        PID(float Kp = 0, float Ki = 0, float Kd = 0, float minOut = -255, float maxOut = 255)
-        : kp(Kp), ki(Ki), kd(Kd), setpoint(0), integral(0), integralMin(-1000), integralMax(1000), lastError(0), outMin(minOut), outMax(maxOut), pTerm(0), iTerm(0), dTerm(0), lastTime(0) {}
+// Твои переменные добавки к ШИМ
+int AddPWMA = 0;
+int AddPWMB = 0;
 
-        void setTunings(float Kp, float Ki, float Kd) {
-            kp = Kp;
-            ki = Ki;
-            kd = Kd;
-        }
+struct PID
+{
+    float kp, ki, kd;
+    float setpoint;
+    float integral;
+    float integralMin, integralMax;
+    float lastError;
+    float outMin, outMax;
+    unsigned long lastTime;
 
-        void setOutputLimits(float minOut, float maxOut) {
-            outMin = minOut;
-            outMax = maxOut;
-        }
+    PID(float Kp = 0, float Ki = 0, float Kd = 0, float minOut = -255, float maxOut = 255)
+        : kp(Kp), ki(Ki), kd(Kd), setpoint(0), integral(0), integralMin(-100), integralMax(100), lastError(0), outMin(minOut), outMax(maxOut), lastTime(0) {}
 
-        void setIntegralLimits(float minI, float maxI) {
-            integralMin = minI;
-            integralMax = maxI;
-        }
+    void SetSetpoint(float value) { setpoint = value; }
 
-        void SetSetpoint(float value ){
-            setpoint = value;
-        }
-
-        float getP() const { return pTerm; }
-        float getI() const { return iTerm; }
-        float getD() const { return dTerm; }
-
-        float compute(float input, unsigned long now ) {
-            float error = setpoint - input;
-            if (lastTime == 0) {
-                lastTime = now;
-                lastError = error;
-            }
-            float dt = (now - lastTime) / 1000.0f;
-            if (dt <= 0) {
-                dt = 0.001f;
-            }
-            integral += error * dt;
-            if (integral > integralMax) integral = integralMax;
-            if (integral < integralMin) integral = integralMin;
-            float derivative = (error - lastError) / dt;
-            pTerm = kp * error;
-            iTerm = ki * integral;
-            dTerm = kd * derivative;
-            float output = pTerm + iTerm + dTerm;
-            if (output > outMax) output = outMax;
-            if (output < outMin) output = outMin;
-            lastError = error;
+    float compute(float input, unsigned long now)
+    {
+        float error = setpoint - input;
+        if (lastTime == 0)
+        {
             lastTime = now;
-            return output;
+            lastError = error;
         }
+        float dt = (now - lastTime) / 1000.0f;
+        if (dt <= 0)
+            dt = 0.005f; // Защита от нуля
 
-        void reset() {
-            integral = 0;
-            lastError = 0;
-            lastTime = 0;
-        }
-    };
+        integral += error * dt;
+        if (integral > integralMax)
+            integral = integralMax;
+        if (integral < integralMin)
+            integral = integralMin;
 
+        float derivative = (error - lastError) / dt;
+        float output = (kp * error) + (ki * integral) + (kd * derivative);
 
+        if (output > outMax)
+            output = outMax;
+        if (output < outMin)
+            output = outMin;
 
-
-    PID pidA(2.0f, 0.02f, 0.005f, -255, 255);
-    PID pidB(2.0f, 0.02f, 0.005f, -255, 255);
-    // PID pidBalance(0.8f, 0.02f, 0.02f, -255, 255);
-
-
-
-
-    void setSpeedA(int speed){
-        if(speed < 0 ){
-            digitalWrite(motorA1 , false);
-            digitalWrite(motorA2 , true);
-        }
-        else{
-            digitalWrite(motorA1 , true);
-            digitalWrite(motorA2 , false);
-        }
-    analogWrite(motorAPWM , abs(speed));
+        lastError = error;
+        lastTime = now;
+        return output;
     }
+};
 
+// Выход ПИДа расширен до стандартных лимитов ШИМ (-255, 255), так как функции маппинга ожидают этот диапазон
+PID pidBalance(20.0f, 0.1f, 0.6f, -255, 255);
+// PID pidEncoder(0.1f, 0.1f, 0.0f, -2.5f, 2.5f);
+PID pidPosition(0.2f, 0.0f, 0.0f, -5.0f, 5.0f);
 
-    void setSpeedB(int speed){
-        if(speed < 0 ){
-            digitalWrite(motorB1 , false);
-            digitalWrite(motorB2 , true);
-        }
-        else{
-            digitalWrite(motorB1 , true);
-            digitalWrite(motorB2 , false);
-        }
-    analogWrite(motorBPWM , abs(speed));
+int setSpeedA(int speed)
+{
+    int target_PWM = 0;
+    if (speed > 0)
+    {
+        target_PWM = map(speed, 0, 255, MinPWM, 255);
+        digitalWrite(motorA1, false);
+        digitalWrite(motorA2, true);
     }
-    void flag1(){
-        if(digitalRead(ENC1A) == digitalRead(ENC1B)){
-            enc1++;
-        }
-        else{
-            enc1--;
-        }
+    else if (speed < 0)
+    {
+        target_PWM = map(speed, -255, 0, -255, -MinPWM);
+        digitalWrite(motorA1, true);
+        digitalWrite(motorA2, false);
     }
-
-    void flag2(){
-        if(digitalRead(ENC2A) == digitalRead(ENC2B)){
-            enc2++;
-        }
-        else{
-            enc2--;
-        }
+    else
+    {
+        target_PWM = 0;
     }
+    analogWrite(motorAPWM, abs(target_PWM));
+    return target_PWM;
+}
 
-    void setup() {
+int setSpeedB(int speed)
+{
+    int target_PWM = 0;
+    if (speed > 0)
+    {
+        target_PWM = map(speed, 0, 255, MinPWM, 255);
+        digitalWrite(motorB1, false);
+        digitalWrite(motorB2, true);
+    }
+    else if (speed < 0)
+    {
+        target_PWM = map(speed, -255, 0, -255, -MinPWM);
+        digitalWrite(motorB1, true);
+        digitalWrite(motorB2, false);
+    }
+    else
+    {
+        target_PWM = 0;
+    }
+    analogWrite(motorBPWM, abs(target_PWM));
+    return target_PWM;
+}
+
+void flag1()
+{
+    if (digitalRead(ENC1A) == digitalRead(ENC1B))
+        enc1++;
+    else
+        enc1--;
+}
+void flag2()
+{
+    if (digitalRead(ENC2A) == digitalRead(ENC2B))
+        enc2--;
+    else
+        enc2++;
+}
+
+uint8_t fifoBuffer[45];
+
+void setup()
+{
     Serial.begin(115200);
+    BTSerial.begin(9600); // 9600 для стабильности SoftwareSerial
     Wire.begin();
-    //Wire.setClock(1000000UL);   // разгоняем шину на максимум
-    pinMode(motorAPWM , OUTPUT);
-    pinMode(motorBPWM , OUTPUT);
-    pinMode(motorA1 , OUTPUT);
-    pinMode(motorA2 , OUTPUT);
-    pinMode(motorB1 , OUTPUT);
-    pinMode(motorB2 , OUTPUT);
+    Wire.setClock(400000UL); // 400 кГц
 
-    pinMode(ENC1A , INPUT_PULLUP);
-    pinMode(ENC1B , INPUT_PULLUP);
-    pinMode(ENC2A  , INPUT_PULLUP);
-    pinMode(ENC2B , INPUT_PULLUP);
+    pinMode(motorAPWM, OUTPUT);
+    pinMode(motorBPWM, OUTPUT);
+    pinMode(motorA1, OUTPUT);
+    pinMode(motorA2, OUTPUT);
+    pinMode(motorB1, OUTPUT);
+    pinMode(motorB2, OUTPUT);
 
-    attachInterrupt(digitalPinToInterrupt(ENC1A) , flag1 , RISING);
-    attachInterrupt(digitalPinToInterrupt(ENC2A) , flag2 , RISING);
+    pinMode(ENC1A, INPUT_PULLUP);
+    pinMode(ENC1B, INPUT_PULLUP);
+    pinMode(ENC2A, INPUT_PULLUP);
+    pinMode(ENC2B, INPUT_PULLUP);
 
+    attachInterrupt(digitalPinToInterrupt(ENC1A), flag1, RISING);
+    attachInterrupt(digitalPinToInterrupt(ENC2A), flag2, RISING);
 
-    // инициализация DMP
     mpu.initialize();
-    mpu.dmpInitialize();
-    mpu.setDMPEnabled(true);
-        lastSpeedCheck = millis();
+    uint8_t devStatus = mpu.dmpInitialize();
+    if (devStatus == 0)
+    {
+        mpu.setDMPEnabled(true);
+        pidBalance.SetSetpoint(initialSetPoint);
+        Serial.println(F("DMP Готов!"));
     }
+    else
+    {
+        Serial.print(F("Ошибка DMP: "));
+        Serial.println(devStatus);
+        while (1)
+            ;
+    }
+}
 
+float pitch;
 
+void intervalControl()
+{
+    // Если управление не запускали, ничего не делаем
+    if (!isControlActive)
+        return;
 
-    void loop() {
-    unsigned long now = millis();
+    // Если с момента запуска прошло больше 500 мс
+    if (millis() - controlTimer >= controlDelay)
+    {
+        AddPWMA = 0;
+        AddPWMB = 0;
+        isControlActive = false; // Выключаем таймер до следующего нажатия
+        Serial.println(F("Время вышло: AddPWM сброшен в 0"));
+    }
+}
+void loop()
+{
+    // 1. Чтение Bluetooth команд (Управление через смещение энкодеров)
+    if (BTSerial.available() > 0)
+    {
+        char key = BTSerial.read();
 
-        if (now - lastSpeedCheck >= speedCheckInterval) {
-            
+        // Смещаем энкодеры, чтобы внешний ПИД думал, что мы ушли с точки, и вел робота за собой
+        if (key == 'W')
+        {
             noInterrupts();
-            long currentEnc1 = enc1;
-            long currentEnc2 = enc2;
+            enc1 -= 50;
+            enc2 -= 50;
             interrupts();
-
-            long deltaEnc1 = currentEnc1 - prevEnc1;
-            long deltaEnc2 = currentEnc2 - prevEnc2;
-
-            prevEnc1 = currentEnc1;
-            prevEnc2 = currentEnc2;
-
-            
-
-            float dt = (now - lastSpeedCheck) / 1000.0f;
-            lastSpeedCheck = now;
-
-            speedRPM1 = ((float)deltaEnc1 / pulsesPerRevolution) / dt * 60.0f;
-            speedRPM2 = ((float)deltaEnc2 / pulsesPerRevolution) / dt * 60.0f;
-
-            float pidAC = pidA.compute(speedRPM1,now);
-            float pidBC = pidB.compute(speedRPM2,now); 
-
-            setSpeedA(pidAC);
-            setSpeedB(pidBC);
-
-            Serial.print(">");
-            Serial.print("speed A:" );
-            Serial.print(pidAC );
-            Serial.print(",speed B:" );
-            Serial.print(pidBC );
-            
-            
-
-
-            // Вывод в Serial (удобно смотреть через "Плоттер по прерываниям" / Serial Plotter)
-            Serial.print(",RPM1:");
-            Serial.print(speedRPM1);
-            Serial.print(",");
-            Serial.print("RPM2:");
-            Serial.println(speedRPM2);
+            controlTimer = millis();
+            isControlActive = true;
         }
-
-
-
-        // 2. ТЕСТОВОЕ УПРАВЛЕНИЕ: отправьте число от -220 до 220 в Монитор Порта
-        if (Serial.available() > 0) {
-            String input = Serial.readStringUntil('\n');
-            input.trim();
-            
-            // Проверяем, что ввели число (учитывая возможный минус)
-            if (input.length() != 0 && (isdigit(input[0]) || input[0] == '-')) {
-                int targetSpeed = 100;
-
-                pidA.SetSetpoint(targetSpeed);
-                pidB.SetSetpoint(targetSpeed);
-
-                Serial.print("-> PWM set to: ");
-                Serial.println(targetSpeed);
-            }
+        else if (key == 'S')
+        {
+            noInterrupts();
+            enc1 += 50;
+            enc2 += 50;
+            interrupts();
+            controlTimer = millis();
+            isControlActive = true;
+        }
+        else if (key == 'A')
+        {
+            noInterrupts();
+            enc1 -= 15;
+            enc2 += 15;
+            interrupts();
+            controlTimer = millis();
+            isControlActive = true;
+        }
+        else if (key == 'D')
+        {
+            noInterrupts();
+            enc1 += 15;
+            enc2 -= 15;
+            interrupts();
+            controlTimer = millis();
+            isControlActive = true;
         }
     }
+
+    // 2. Получение угла от MPU6050
+    if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
+    {
+        Quaternion q;
+        VectorFloat gravity;
+        float ypr[3];
+        mpu.dmpGetQuaternion(&q, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q);
+        mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
+        pitch = ypr[2] * RAD_TO_DEG;
+    }
+
+    unsigned long now = millis();
+    intervalControl();
+
+    // 3. Главный контур управления (100 Гц)
+    if (now - lastLoopCheck >= loopInterval)
+    {
+        // Атомарно забираем тики одометрии
+        noInterrupts();
+        long enc1Copy = enc1;
+        long enc2Copy = enc2;
+        interrupts();
+
+        // Текущая точка робота (среднее или сумма тиков)
+        long currentPosition = enc1Copy + enc2Copy;
+
+        // --- ВНЕШНИЙ ПИД (Позиция -> Целевой угол) ---
+        // Цель внешнего ПИДа всегда 0 (удерживать координату старта)
+        pidPosition.SetSetpoint(targetEnc);
+
+        // Считаем, на какой угол нужно отклониться, чтобы вернуться в targetEnc
+        // На выходе получаем значение от -5.0 до 5.0 (так как мы ограничили outMin/outMax)
+        float angleCorrection = pidPosition.compute(currentPosition, now);
+
+        // Корректируем базовый балансировочный угол
+        float targetSetPoint = initialSetPoint - angleCorrection;
+
+        // --- ВНУТРЕННИЙ ПИД (Угол -> ШИМ моторов) ---
+        pidBalance.SetSetpoint(targetSetPoint);
+        float totalPWM = pidBalance.compute(pitch, now);
+
+        // Проверка на аварийное падение (угол > 70 градусов)
+        if (abs(pitch) >= 70)
+        {
+            setSpeedA(0);
+            setSpeedB(0);
+            // Обнуляем энкодеры и интегратор при падении, чтобы робот не бесился в руках
+            noInterrupts();
+            enc1 = 0;
+            enc2 = 0;
+            interrupts();
+            pidPosition.integral = 0;
+            pidBalance.integral = 0;
+        }
+        else
+        {
+            // Передаем чистый скорректированный ПИДом сигнал на моторы
+            setSpeedA(totalPWM);
+            setSpeedB(totalPWM);
+        }
+
+        // Вывод данных в Serial Monitor / Teleplot
+        Serial.print(">pitch:");
+        Serial.print(pitch);
+        Serial.print(",position:");
+        Serial.print(currentPosition);
+        Serial.print(",angleCorrection:");
+        Serial.print(angleCorrection);
+        Serial.print(",PWM:");
+        Serial.print(totalPWM);
+        Serial.print(",setPoint:");
+        Serial.println(pidBalance.setpoint);
+
+        prevEnc1 = enc1Copy;
+        prevEnc2 = enc2Copy;
+        lastLoopCheck = now;
+    }
+}
