@@ -84,11 +84,11 @@ struct PID
     }
 };
 
-PID pidBalance(22.0f, 0.0f, 0.5f, -255, 255);
+PID pidBalance(22.0f, 0.0f, 0.7f, -255, 255);
 
 // ВНЕШНИЙ ПИД (PI_speed + Позиция): Медленный контур, управляющий скоростью и удержанием точки.
 // Выдает целевой угол отклонения от вертикали. Тормозит накопление интеграла жесткими лимитами.
-PID pidSpeed(0.5f, 0.5f, 0.0f, -MAX_TARGET_ANGLE, MAX_TARGET_ANGLE);
+PID pidSpeed(0.5f, 0.0f, 0.0f, -MAX_TARGET_ANGLE, MAX_TARGET_ANGLE);
 
 float btTargetSpeed = 0.0f;
 float btSteeringBias = 0.0f;
@@ -97,6 +97,14 @@ const float BT_STEERING_STEP = 15.0f;
 const float BT_SPEED_MAX = 40.0f;
 const float BT_STEERING_MAX = 100.0f;
 const unsigned long BT_COMMAND_TIMEOUT = 500; // 1
+
+long targetEncoderTicks = 0;
+long startEncoderPos = 0;
+char btCommandBuffer[10];
+int btCommandIndex = 0;
+bool btDistanceActive = false;
+
+const long WASD_DISTANCE = 5;
 
 int setSpeedA(int speed)
 {
@@ -157,30 +165,85 @@ void processBluetoothCommands()
         if (cmd >= 'A' && cmd <= 'Z')
             cmd += 'a' - 'A';
 
-        switch (cmd)
+        if (cmd >= '0' && cmd <= '9')
         {
-        case 'w':
-            btTargetSpeed += BT_SPEED_STEP;
-            break;
-        case 's':
-            btTargetSpeed -= BT_SPEED_STEP;
-            break;
-        case 'a':
-            btSteeringBias -= BT_STEERING_STEP;
-            break;
-        case 'd':
-            btSteeringBias += BT_STEERING_STEP;
-            break;
-        case 'x':
-            btTargetSpeed = 0;
-            btSteeringBias = 0;
-            break;
-        default:
-            break;
+            if (btCommandIndex < 9)
+            {
+                btCommandBuffer[btCommandIndex++] = cmd;
+            }
         }
-
-        btTargetSpeed = constrain(btTargetSpeed, -BT_SPEED_MAX, BT_SPEED_MAX);
-        btSteeringBias = constrain(btSteeringBias, -BT_STEERING_MAX, BT_STEERING_MAX);
+        else if (cmd == '\r' || cmd == '\n')
+        {
+            if (btCommandIndex > 0)
+            {
+                btCommandBuffer[btCommandIndex] = '\0';
+                targetEncoderTicks = atol(btCommandBuffer);
+                startEncoderPos = (enc1 + enc2) / 2;
+                btDistanceActive = true;
+                btTargetSpeed = 0;
+                btSteeringBias = 0;
+                btSerial.print(F("Target: "));
+                btSerial.println(targetEncoderTicks);
+                btCommandIndex = 0;
+            }
+        }
+        else if (cmd == 'c')
+        {
+            btCommandIndex = 0;
+            memset(btCommandBuffer, 0, 10);
+        }
+        else
+        {
+            switch (cmd)
+            {
+            case 'w':
+                if (!btDistanceActive)
+                {
+                    startEncoderPos = (enc1 + enc2) / 2;
+                    targetEncoderTicks = WASD_DISTANCE;
+                    btTargetSpeed = BT_SPEED_MAX * 0.1f;
+                    btDistanceActive = true;
+                }
+                break;
+            case 's':
+                if (!btDistanceActive)
+                {
+                    startEncoderPos = (enc1 + enc2) / 2;
+                    targetEncoderTicks = WASD_DISTANCE;
+                    btTargetSpeed = -BT_SPEED_MAX * 0.1f;
+                    btDistanceActive = true;
+                }
+                break;
+            case 'a':
+                if (!btDistanceActive)
+                {
+                    startEncoderPos = (enc1 + enc2) / 2;
+                    targetEncoderTicks = WASD_DISTANCE;
+                    btSteeringBias = -BT_STEERING_MAX;
+                    btTargetSpeed = BT_SPEED_MAX * 0.1f;
+                    btDistanceActive = true;
+                }
+                break;
+            case 'd':
+                if (!btDistanceActive)
+                {
+                    startEncoderPos = (enc1 + enc2) / 2;
+                    targetEncoderTicks = WASD_DISTANCE;
+                    btSteeringBias = BT_STEERING_MAX;
+                    btTargetSpeed = BT_SPEED_MAX * 0.1f;
+                    btDistanceActive = true;
+                }
+                break;
+            case 'x':
+                btTargetSpeed = 0;
+                btSteeringBias = 0;
+                btDistanceActive = false;
+                targetEncoderTicks = 0;
+                break;
+            default:
+                break;
+            }
+        }
     }
 }
 
@@ -271,6 +334,21 @@ void loop()
         long enc1Copy = enc1;
         long enc2Copy = enc2;
         interrupts();
+
+        long currentEncoderAvg = (enc1Copy + enc2Copy) / 2;
+        long distanceTraveled = abs(currentEncoderAvg - startEncoderPos);
+
+        // Проверка достижения целевого расстояния
+        if (btDistanceActive && targetEncoderTicks > 0)
+        {
+            if (distanceTraveled >= targetEncoderTicks)
+            {
+                btTargetSpeed = 0;
+                btSteeringBias = 0;
+                btDistanceActive = false;
+                btSerial.println(F("Done"));
+            }
+        }
 
         long currentSpeed = (enc1Copy + enc2Copy) - (prevEnc1 + prevEnc2);
 
