@@ -1,15 +1,16 @@
 #include <Arduino.h>
+#include <SoftwareSerial.h>
 #include "I2Cdev.h"
 #include "MPU6050_6Axis_MotionApps20.h"
 #include "Wire.h"
-#include <SoftwareSerial.h>
-SoftwareSerial BTSerial(6, 11); // RX, TX
+
+SoftwareSerial btSerial(A0, A1);
 
 MPU6050 mpu;
 
-#define ENC1A 2
+#define ENC1A 3
 #define ENC1B 4
-#define ENC2A 3
+#define ENC2A 2
 #define ENC2B 5
 
 volatile long enc1 = 0;
@@ -19,35 +20,22 @@ volatile long enc2 = 0;
 #define motorA2 13
 #define motorB1 7
 #define motorB2 8
-#define motorAPWM 10
-#define motorBPWM 9
+#define motorAPWM 11
+#define motorBPWM 10
 
 unsigned long lastLoopCheck = 0;
-const unsigned long loopInterval = 10;
-const unsigned long loopIntervalForControl = 100; // 100 Гц
+const unsigned long loopInterval = 10; // 100 Гц (dt = 0.01с)
 
 static long prevEnc1 = 0;
 static long prevEnc2 = 0;
 
 #define MinPWM 35
 
-// --- Переменные для адаптивного сетпоинта ---
-const float initialSetPoint = 6.9f; // ПРОВЕРЬ ЭТОТ УГОЛ РУКАМИ!
+// --- Базовая вертикаль ---
+const float initialSetPoint = 10.5f;
 
-float smoothedPWM = 0.0f;
-
-const int targetEnc = 0;
-
-const float K_pos = 0.002f;  // Насколько сильно робот хочет вернуться в начальную точку
-const float K_speed = 0.05f; // Насколько сильно робот гасит свою скорость (аналог Kd для колес)
-
-unsigned long controlTimer = 500;       // Таймер для сброса
-const unsigned long controlDelay = 500; // Промежуток времени (0.5 сек)
-bool isControlActive = false;           // Флаг, что управление сейчас активно
-
-// Твои переменные добавки к ШИМ
-int AddPWMA = 0;
-int AddPWMB = 0;
+// Ограничение максимального угла наклона, который может потребовать регулятор скорости
+const float MAX_TARGET_ANGLE = 5.0f;
 
 struct PID
 {
@@ -74,7 +62,7 @@ struct PID
         }
         float dt = (now - lastTime) / 1000.0f;
         if (dt <= 0)
-            dt = 0.005f; // Защита от нуля
+            dt = 0.010f;
 
         integral += error * dt;
         if (integral > integralMax)
@@ -96,10 +84,19 @@ struct PID
     }
 };
 
-// Выход ПИДа расширен до стандартных лимитов ШИМ (-255, 255), так как функции маппинга ожидают этот диапазон
-PID pidBalance(20.0f, 0.1f, 0.6f, -255, 255);
-// PID pidEncoder(0.1f, 0.1f, 0.0f, -2.5f, 2.5f);
-PID pidPosition(0.2f, 0.0f, 0.0f, -5.0f, 5.0f);
+PID pidBalance(22.0f, 0.0f, 0.5f, -255, 255);
+
+// ВНЕШНИЙ ПИД (PI_speed + Позиция): Медленный контур, управляющий скоростью и удержанием точки.
+// Выдает целевой угол отклонения от вертикали. Тормозит накопление интеграла жесткими лимитами.
+PID pidSpeed(0.5f, 0.5f, 0.0f, -MAX_TARGET_ANGLE, MAX_TARGET_ANGLE);
+
+float btTargetSpeed = 0.0f;
+float btSteeringBias = 0.0f;
+const float BT_SPEED_STEP = 5.0f;
+const float BT_STEERING_STEP = 15.0f;
+const float BT_SPEED_MAX = 40.0f;
+const float BT_STEERING_MAX = 100.0f;
+const unsigned long BT_COMMAND_TIMEOUT = 500; // 1
 
 int setSpeedA(int speed)
 {
@@ -141,10 +138,50 @@ int setSpeedB(int speed)
     }
     else
     {
+
         target_PWM = 0;
     }
     analogWrite(motorBPWM, abs(target_PWM));
     return target_PWM;
+}
+
+void processBluetoothCommands()
+{
+    while (btSerial.available())
+    {
+        int incoming = btSerial.read();
+        if (incoming < 0)
+            continue;
+
+        char cmd = (char)incoming;
+        if (cmd >= 'A' && cmd <= 'Z')
+            cmd += 'a' - 'A';
+
+        switch (cmd)
+        {
+        case 'w':
+            btTargetSpeed += BT_SPEED_STEP;
+            break;
+        case 's':
+            btTargetSpeed -= BT_SPEED_STEP;
+            break;
+        case 'a':
+            btSteeringBias -= BT_STEERING_STEP;
+            break;
+        case 'd':
+            btSteeringBias += BT_STEERING_STEP;
+            break;
+        case 'x':
+            btTargetSpeed = 0;
+            btSteeringBias = 0;
+            break;
+        default:
+            break;
+        }
+
+        btTargetSpeed = constrain(btTargetSpeed, -BT_SPEED_MAX, BT_SPEED_MAX);
+        btSteeringBias = constrain(btSteeringBias, -BT_STEERING_MAX, BT_STEERING_MAX);
+    }
 }
 
 void flag1()
@@ -167,9 +204,8 @@ uint8_t fifoBuffer[45];
 void setup()
 {
     Serial.begin(115200);
-    BTSerial.begin(9600); // 9600 для стабильности SoftwareSerial
     Wire.begin();
-    Wire.setClock(400000UL); // 400 кГц
+    Wire.setClock(400000UL);
 
     pinMode(motorAPWM, OUTPUT);
     pinMode(motorBPWM, OUTPUT);
@@ -186,87 +222,34 @@ void setup()
     attachInterrupt(digitalPinToInterrupt(ENC1A), flag1, RISING);
     attachInterrupt(digitalPinToInterrupt(ENC2A), flag2, RISING);
 
+    btSerial.begin(9600);
+    btSerial.println(F("BT Ready"));
+
     mpu.initialize();
     uint8_t devStatus = mpu.dmpInitialize();
     if (devStatus == 0)
     {
         mpu.setDMPEnabled(true);
-        pidBalance.SetSetpoint(initialSetPoint);
+
+        pidSpeed.integralMin = -2.0f;
+        pidSpeed.integralMax = 2.0f;
+        pidSpeed.SetSetpoint(0);
+
         Serial.println(F("DMP Готов!"));
     }
     else
     {
         Serial.print(F("Ошибка DMP: "));
         Serial.println(devStatus);
-        while (1)
-            ;
     }
 }
 
 float pitch;
+float actualAveragedSpeed = 0.0f;
+float positionError = 0.0f;
 
-void intervalControl()
-{
-    // Если управление не запускали, ничего не делаем
-    if (!isControlActive)
-        return;
-
-    // Если с момента запуска прошло больше 500 мс
-    if (millis() - controlTimer >= controlDelay)
-    {
-        AddPWMA = 0;
-        AddPWMB = 0;
-        isControlActive = false; // Выключаем таймер до следующего нажатия
-        Serial.println(F("Время вышло: AddPWM сброшен в 0"));
-    }
-}
 void loop()
 {
-    // 1. Чтение Bluetooth команд (Управление через смещение энкодеров)
-    if (BTSerial.available() > 0)
-    {
-        char key = BTSerial.read();
-
-        // Смещаем энкодеры, чтобы внешний ПИД думал, что мы ушли с точки, и вел робота за собой
-        if (key == 'W')
-        {
-            noInterrupts();
-            enc1 -= 50;
-            enc2 -= 50;
-            interrupts();
-            controlTimer = millis();
-            isControlActive = true;
-        }
-        else if (key == 'S')
-        {
-            noInterrupts();
-            enc1 += 50;
-            enc2 += 50;
-            interrupts();
-            controlTimer = millis();
-            isControlActive = true;
-        }
-        else if (key == 'A')
-        {
-            noInterrupts();
-            enc1 -= 15;
-            enc2 += 15;
-            interrupts();
-            controlTimer = millis();
-            isControlActive = true;
-        }
-        else if (key == 'D')
-        {
-            noInterrupts();
-            enc1 += 15;
-            enc2 -= 15;
-            interrupts();
-            controlTimer = millis();
-            isControlActive = true;
-        }
-    }
-
-    // 2. Получение угла от MPU6050
     if (mpu.dmpGetCurrentFIFOPacket(fifoBuffer))
     {
         Quaternion q;
@@ -279,66 +262,65 @@ void loop()
     }
 
     unsigned long now = millis();
-    intervalControl();
 
-    // 3. Главный контур управления (100 Гц)
+    processBluetoothCommands();
+
     if (now - lastLoopCheck >= loopInterval)
     {
-        // Атомарно забираем тики одометрии
         noInterrupts();
         long enc1Copy = enc1;
         long enc2Copy = enc2;
         interrupts();
 
-        // Текущая точка робота (среднее или сумма тиков)
-        long currentPosition = enc1Copy + enc2Copy;
+        long currentSpeed = (enc1Copy + enc2Copy) - (prevEnc1 + prevEnc2);
 
-        // --- ВНЕШНИЙ ПИД (Позиция -> Целевой угол) ---
-        // Цель внешнего ПИДа всегда 0 (удерживать координату старта)
-        pidPosition.SetSetpoint(targetEnc);
+        actualAveragedSpeed = (actualAveragedSpeed * 0.92f) + ((float)currentSpeed * 0.08f);
 
-        // Считаем, на какой угол нужно отклониться, чтобы вернуться в targetEnc
-        // На выходе получаем значение от -5.0 до 5.0 (так как мы ограничили outMin/outMax)
-        float angleCorrection = pidPosition.compute(currentPosition, now);
+        positionError += actualAveragedSpeed;
+        positionError = constrain(positionError, -100.0f, 100.0f);
 
-        // Корректируем базовый балансировочный угол
-        float targetSetPoint = initialSetPoint - angleCorrection;
+        pidSpeed.SetSetpoint(btTargetSpeed);
+        float speedInput = actualAveragedSpeed + (positionError * 0.005f);
+        float targetAngleOffset = pidSpeed.compute(speedInput, now);
 
-        // --- ВНУТРЕННИЙ ПИД (Угол -> ШИМ моторов) ---
-        pidBalance.SetSetpoint(targetSetPoint);
+        float finalSetpoint = initialSetPoint + targetAngleOffset;
+        pidBalance.SetSetpoint(finalSetpoint);
+
         float totalPWM = pidBalance.compute(pitch, now);
 
-        // Проверка на аварийное падение (угол > 70 градусов)
         if (abs(pitch) >= 70)
         {
             setSpeedA(0);
             setSpeedB(0);
-            // Обнуляем энкодеры и интегратор при падении, чтобы робот не бесился в руках
             noInterrupts();
             enc1 = 0;
             enc2 = 0;
             interrupts();
-            pidPosition.integral = 0;
             pidBalance.integral = 0;
+            pidSpeed.integral = 0;
+            positionError = 0.0f;
+            actualAveragedSpeed = 0.0f;
         }
         else
         {
-            // Передаем чистый скорректированный ПИДом сигнал на моторы
-            setSpeedA(totalPWM);
-            setSpeedB(totalPWM);
+            int leftPWM = constrain((int)(totalPWM + btSteeringBias), -255, 255);
+            int rightPWM = constrain((int)(totalPWM - btSteeringBias), -255, 255);
+            setSpeedA(leftPWM);
+            setSpeedB(rightPWM);
         }
 
-        // Вывод данных в Serial Monitor / Teleplot
         Serial.print(">pitch:");
         Serial.print(pitch);
-        Serial.print(",position:");
-        Serial.print(currentPosition);
-        Serial.print(",angleCorrection:");
-        Serial.print(angleCorrection);
-        Serial.print(",PWM:");
-        Serial.print(totalPWM);
+        Serial.print(",averagedSpeed:");
+        Serial.print(actualAveragedSpeed);
+        Serial.print(",positionError:");
+        Serial.print(positionError);
+        Serial.print(",targetAngleOffset:");
+        Serial.print(targetAngleOffset);
         Serial.print(",setPoint:");
-        Serial.println(pidBalance.setpoint);
+        Serial.print(pidBalance.setpoint);
+        Serial.print(",PWM:");
+        Serial.println(totalPWM);
 
         prevEnc1 = enc1Copy;
         prevEnc2 = enc2Copy;
